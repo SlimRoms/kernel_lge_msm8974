@@ -97,6 +97,8 @@
 #define WCD9XXX_IRQ_MBHC_JACK_SWITCH_TAIKO 28
 #define WCD9XXX_IRQ_MBHC_JACK_SWITCH_TAPAN 21
 
+#define HPH_TRANS_THRESHOLD 2
+
 static bool detect_use_vddio_switch = true;
 
 struct wcd9xxx_mbhc_detect {
@@ -2209,6 +2211,7 @@ static void wcd9xxx_correct_swch_plug(struct work_struct *work)
 	enum wcd9xxx_mbhc_plug_type plug_type = PLUG_TYPE_INVALID;
 	unsigned long timeout;
 	int retry = 0, pt_gnd_mic_swap_cnt = 0;
+	int hph_trans_cnt = 0;
 	bool correction = false;
 
 	pr_debug("%s: enter\n", __func__);
@@ -2295,6 +2298,13 @@ static void wcd9xxx_correct_swch_plug(struct work_struct *work)
 				}
 			} else
 				pt_gnd_mic_swap_cnt = 0;
+
+			if (plug_type == PLUG_TYPE_HEADSET) {
+				hph_trans_cnt++;
+				if (hph_trans_cnt < HPH_TRANS_THRESHOLD)
+					continue;
+				} else
+					hph_trans_cnt = 0;
 
 			WCD9XXX_BCL_LOCK(mbhc->resmgr);
 			/* Turn off override */
