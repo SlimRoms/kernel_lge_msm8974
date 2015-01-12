@@ -1,6 +1,7 @@
 include include/asm-generic/Kbuild.asm
 
 header-y += hwcap.h
+header-y += barrier.h
 
 generic-y += auxvec.h
 generic-y += bitsperlong.h
