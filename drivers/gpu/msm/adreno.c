@@ -629,7 +629,7 @@ int adreno_perfcounter_query_group(struct adreno_device *adreno_dev,
 		return 0;
 	}
 
-	t = min_t(int, group->reg_count, count);
+	t = min_t(unsigned int, group->reg_count, count);
 
 	buf = kmalloc(t * sizeof(unsigned int), GFP_KERNEL);
 	if (buf == NULL) {
@@ -2084,11 +2084,13 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 	kgsl_pwrctrl_irq(device, KGSL_PWRFLAGS_ON);
 	device->ftbl->irqctrl(device, 1);
 
-	adreno_perfcounter_start(adreno_dev);
-
 	status = adreno_ringbuffer_cold_start(&adreno_dev->ringbuffer);
 	if (status)
 		goto error_irq_off;
+
+	status = adreno_perfcounter_start(adreno_dev);
+	if (status)
+		goto error_rb_stop;
 
 	/* Start the dispatcher */
 	adreno_dispatcher_start(device);
@@ -2099,6 +2101,8 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 
 	return 0;
 
+error_rb_stop:
+	adreno_ringbuffer_stop(&adreno_dev->ringbuffer);
 error_irq_off:
 	kgsl_pwrctrl_irq(device, KGSL_PWRFLAGS_OFF);
 
@@ -2139,43 +2143,19 @@ static int adreno_start(struct kgsl_device *device, int priority)
 	return ret;
 }
 
-/**
- * adreno_vbif_clear_pending_transactions() - Clear transactions in VBIF pipe
- * @device: Pointer to the device whose VBIF pipe is to be cleared
- */
-static void adreno_vbif_clear_pending_transactions(struct kgsl_device *device)
-{
-	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
-	unsigned int mask = A3XX_VBIF_XIN_HALT_CTRL0_MASK;
-	unsigned int val;
-	unsigned long wait_for_vbif;
-
-	adreno_writereg(adreno_dev, ADRENO_REG_VBIF_XIN_HALT_CTRL0, mask);
-	/* wait for the transactions to clear */
-	wait_for_vbif = jiffies + msecs_to_jiffies(100);
-	while (1) {
-		adreno_readreg(adreno_dev,
-			ADRENO_REG_VBIF_XIN_HALT_CTRL1, &val);
-		if ((val & mask) == mask)
-			break;
-		if (time_after(jiffies, wait_for_vbif))
-			break;
-	}
-	adreno_writereg(adreno_dev, ADRENO_REG_VBIF_XIN_HALT_CTRL0, 0);
-}
-
 static int adreno_stop(struct kgsl_device *device)
 {
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 
-	if (!test_bit(ADRENO_DEVICE_STARTED, &adreno_dev->priv))
-		return 0;
-
-	kgsl_pwrctrl_enable(device);
+	if (adreno_dev->drawctxt_active)
+		kgsl_context_put(&adreno_dev->drawctxt_active->base);
 
 	adreno_dev->drawctxt_active = NULL;
 
 	adreno_dispatcher_stop(adreno_dev);
+	adreno_ringbuffer_stop(&adreno_dev->ringbuffer);
+
+	kgsl_mmu_stop(&device->mmu);
 
 	device->ftbl->irqctrl(device, 0);
 	kgsl_pwrctrl_irq(device, KGSL_PWRFLAGS_OFF);
@@ -2185,8 +2165,6 @@ static int adreno_stop(struct kgsl_device *device)
 
 	/* Save physical performance counter values before GPU power down*/
 	adreno_perfcounter_save(adreno_dev);
-
-	kgsl_mmu_stop(&device->mmu);
 
 	/* Power down the device */
 	kgsl_pwrctrl_disable(device);
@@ -2209,13 +2187,15 @@ static int adreno_stop(struct kgsl_device *device)
 int adreno_reset(struct kgsl_device *device)
 {
 	int ret = -EINVAL;
+	struct kgsl_mmu *mmu = &device->mmu;
 	int i = 0;
 
-	/* clear pending vbif transactions before reset */
-	adreno_vbif_clear_pending_transactions(device);
-
-	/* Try soft reset first */
-	ret = adreno_soft_reset(device);
+	/* Try soft reset first, for non mmu fault case only */
+	if (!atomic_read(&mmu->fault)) {
+		ret = adreno_soft_reset(device);
+		if (ret)
+			KGSL_DEV_ERR_ONCE(device, "Device soft reset failed\n");
+	}
 	if (ret) {
 		/* If soft reset failed/skipped, then pull the power */
 		adreno_stop(device);
@@ -2258,15 +2238,15 @@ int adreno_reset(struct kgsl_device *device)
  *
  * This is a common routine to write to FT sysfs files.
  */
-static int _ft_sysfs_store(const char *buf, size_t count, int *ptr)
+static int _ft_sysfs_store(const char *buf, size_t count, unsigned int *ptr)
 {
 	char temp[20];
-	long val;
+	unsigned long val;
 	int rc;
 
 	snprintf(temp, sizeof(temp), "%.*s",
 			 (int)min(count, sizeof(temp) - 1), buf);
-	rc = kstrtol(temp, 0, &val);
+	rc = kstrtoul(temp, 0, &val);
 	if (rc)
 		return rc;
 
@@ -2631,36 +2611,6 @@ static ssize_t _ft_hang_intr_status_show(struct device *dev,
 		test_bit(ADRENO_DEVICE_HANG_INTR, &adreno_dev->priv) ? 1 : 0);
 }
 
-/**
- * _wake_nice_store() - Store nice level for the higher priority GPU start
- * thread
- * @dev: device ptr
- * @attr: Device attribute
- * @buf: value to write
- * @count: size of the value to write
- *
- */
-static ssize_t _wake_nice_store(struct device *dev,
-				     struct device_attribute *attr,
-				     const char *buf, size_t count)
-{
-	return _ft_sysfs_store(buf, count, &_wake_nice);
-}
-
-/**
- * _wake_nice_show() -  Show nice level for the higher priority GPU start
- * thread
- * @dev: device ptr
- * @attr: Device attribute
- * @buf: value read
- */
-static ssize_t _wake_nice_show(struct device *dev,
-					struct device_attribute *attr,
-					char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%d\n", _wake_nice);
-}
-
 #define FT_DEVICE_ATTR(name) \
 	DEVICE_ATTR(name, 0644,	_ ## name ## _show, _ ## name ## _store);
 
@@ -2670,7 +2620,7 @@ FT_DEVICE_ATTR(ft_fast_hang_detect);
 FT_DEVICE_ATTR(ft_long_ib_detect);
 FT_DEVICE_ATTR(ft_hang_intr_status);
 
-static FT_DEVICE_ATTR(wake_nice);
+static DEVICE_INT_ATTR(wake_nice, 0644, _wake_nice);
 static FT_DEVICE_ATTR(wake_timeout);
 
 const struct device_attribute *ft_attr_list[] = {
@@ -2678,7 +2628,7 @@ const struct device_attribute *ft_attr_list[] = {
 	&dev_attr_ft_pagefault_policy,
 	&dev_attr_ft_fast_hang_detect,
 	&dev_attr_ft_long_ib_detect,
-	&dev_attr_wake_nice,
+	&dev_attr_wake_nice.attr,
 	&dev_attr_wake_timeout,
 	&dev_attr_ft_hang_intr_status,
 	NULL,
@@ -2962,12 +2912,13 @@ int adreno_soft_reset(struct kgsl_device *device)
 		return -EINVAL;
 	}
 
-	clear_bit(ADRENO_DEVICE_STARTED, &adreno_dev->priv);
-
 	if (adreno_dev->drawctxt_active)
 		kgsl_context_put(&adreno_dev->drawctxt_active->base);
 
 	adreno_dev->drawctxt_active = NULL;
+
+	/* Stop the ringbuffer */
+	adreno_ringbuffer_stop(&adreno_dev->ringbuffer);
 
 	if (kgsl_pwrctrl_isenabled(device))
 		device->ftbl->irqctrl(device, 0);
@@ -3010,11 +2961,8 @@ int adreno_soft_reset(struct kgsl_device *device)
 
 	if (ret)
 		return ret;
-	else {
-		device->reset_counter++;
-		set_bit(ADRENO_DEVICE_STARTED, &adreno_dev->priv);
-	}
 
+	device->reset_counter++;
 
 	return 0;
 }
@@ -3076,7 +3024,7 @@ int adreno_idle(struct kgsl_device *device)
 			adreno_getreg(adreno_dev, ADRENO_REG_RBBM_STATUS) << 2,
 			0x110, 0x110);
 
-	while (time_before(jiffies, wait)) {
+	do {
 		/*
 		 * If we fault, stop waiting and return an error. The dispatcher
 		 * will clean up the fault from the work queue, but we need to
@@ -3089,7 +3037,19 @@ int adreno_idle(struct kgsl_device *device)
 
 		if (adreno_isidle(device))
 			return 0;
-	}
+
+	} while (time_before(jiffies, wait));
+
+	/*
+	 * Under rare conditions, preemption can cause the while loop to exit
+	 * without checking if the gpu is idle. check one last time before we
+	 * return failure.
+	 */
+	if (adreno_gpu_fault(adreno_dev) != 0)
+			return -EDEADLK;
+
+	if (adreno_isidle(device))
+			return 0;
 
 	return -ETIMEDOUT;
 }
